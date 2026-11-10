@@ -1,0 +1,141 @@
+name: Fork Windows test package
+run-name: Fork test package ${{ github.ref_name }} ${{ github.sha }}
+# aminenrr/RyGTS-SPS: builds THIS fork's own source (launcher, adcpatch.exe and the shadGT
+# renderer pinned in renderer/source.json with ci/fork/shadgt-patches/*.patch applied) and
+# uploads a Windows Release test zip as a workflow artifact. No secrets are used.
+on:
+  workflow_dispatch:
+  push:
+    branches: [shader-precompile]
+permissions:
+  contents: read
+concurrency:
+  group: fork-package-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  SOURCE_SHA: ${{ github.sha }}
+jobs:
+  windows:
+    name: Windows launcher and renderer
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      RYGT_CI_ROOT: C:/rygt-ci/${{ github.run_id }}
+    steps:
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Fetch this fork's exact source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force $env:RYGT_CI_ROOT | Out-Null
+          Set-Location $env:RYGT_CI_ROOT
+          git init
+          git config core.longpaths true
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin $env:SOURCE_SHA
+          if ($LASTEXITCODE) { throw 'GitHub fetch failed' }
+          git checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -or (git rev-parse HEAD) -cne $env:SOURCE_SHA) { throw 'Source mismatch' }
+      - name: Build Release launcher and patched renderer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:RYGT_CI_ROOT
+          . ./ci/setup-hosted-windows.ps1
+          & ./ci/build-windows.ps1 -Target Launcher
+          & ./ci/build-windows.ps1 -Target Renderer -Flavor Release
+          Get-Content ./.ci-renderer/FORK-PATCHES.txt -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fork-windows-${{ github.sha }}
+          path: |
+            ${{ env.RYGT_CI_ROOT }}/artifacts/launcher/**
+            ${{ env.RYGT_CI_ROOT }}/artifacts/renderer/**
+          if-no-files-found: error
+          retention-days: 7
+  adcpatch:
+    name: adcpatch.exe (win-x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Fetch pinned GTAdhocToolchain and GTToolsSharp and apply RyGT patches
+        run: |
+          set -euo pipefail
+          cd source/tools
+          git clone https://github.com/Nenkai/GTAdhocToolchain.git
+          git -C GTAdhocToolchain checkout --detach 3fecc2ed58e5d46135b2f94d2ce5d3fa8fb7dba0
+          git -C GTAdhocToolchain submodule update --init --recursive
+          git -C GTAdhocToolchain apply --whitespace=nowarn ../adcpatch/GTAdhocToolchain-exact-roundtrip.patch
+          git clone https://github.com/Nenkai/GTToolsSharp.git
+          git -C GTToolsSharp checkout --detach a59e6f17e8bf455bdaab84b88b3d02de3a593fc1
+          git -C GTToolsSharp submodule update --init --recursive
+          git -C GTToolsSharp apply --whitespace=nowarn ../adcpatch/GTToolsSharp-read-only-open.patch
+      - name: Publish adcpatch.exe
+        working-directory: source/tools/adcpatch
+        run: |
+          set -euo pipefail
+          dotnet publish adcpatch.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "$GITHUB_WORKSPACE/adcpatch-out"
+          ls -la "$GITHUB_WORKSPACE/adcpatch-out"
+          test -f "$GITHUB_WORKSPACE/adcpatch-out/adcpatch.exe"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fork-adcpatch-${{ github.sha }}
+          path: adcpatch-out/adcpatch.exe
+          if-no-files-found: error
+          retention-days: 7
+  package:
+    name: Assemble test zip
+    needs: [windows, adcpatch]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fork-windows-${{ github.sha }}
+          path: source/artifacts/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fork-adcpatch-${{ github.sha }}
+          path: source/artifacts/adcpatch/
+      - name: Assemble and validate Release package
+        working-directory: source
+        env:
+          CI_COMMIT_SHA: ${{ github.sha }}
+          CI_PIPELINE_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CI_CHANNEL: ci
+        run: |
+          set -euo pipefail
+          ls -R artifacts | head -50
+          export RYGT_FORK_PATCHES="$(ls ci/fork/shadgt-patches/*.patch 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')"
+          python3 ci/package.py
+          ls -la dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: package_artifact
+        with:
+          name: RyGTS-fork-shader-precompile-${{ github.sha }}
+          path: |
+            source/dist/RyGTS-ci-*.zip
+            source/dist/RyGTS-ci-*.zip.sha256
+            source/dist/CI-PACKAGES.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Summarize
+        env:
+          PACKAGE_URL: ${{ steps.package_artifact.outputs.artifact-url }}
+        run: |
+          echo "### Fork test package" >> "$GITHUB_STEP_SUMMARY"
+          echo "[Download the zip]($PACKAGE_URL)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Renderer: $(python3 -c 'import json;print(json.load(open("source/renderer/source.json"))["commit"])') + $(ls source/ci/fork/shadgt-patches/ | tr '\n' ' ')" >> "$GITHUB_STEP_SUMMARY"

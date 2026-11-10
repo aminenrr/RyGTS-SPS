@@ -47,6 +47,21 @@ def prepare(destination):
         source["repository"] + "\n" + revision + "\n", encoding="utf-8")
     run("git", "-C", str(destination), "-c", "core.longpaths=true",
         "submodule", "update", "--init", "--recursive", "--jobs", "4")
+    apply_fork_patches(root, destination)
+
+
+def apply_fork_patches(root, destination):
+    """aminenrr/RyGTS-SPS fork: renderer changes live as patches in this repository
+    (ci/fork/shadgt-patches/*.patch, applied in name order on the pinned renderer)."""
+    folder = root / "ci" / "fork" / "shadgt-patches"
+    patches = sorted(folder.glob("*.patch")) if folder.is_dir() else []
+    applied = []
+    for patch in patches:
+        run("git", "-C", str(destination), "apply", "--whitespace=nowarn", "--verbose", str(patch))
+        applied.append(patch.name)
+    (destination / "FORK-PATCHES.txt").write_text("".join(name + "\n" for name in applied),
+                                                   encoding="utf-8")
+    print(f"Applied {len(applied)} fork renderer patch(es): {', '.join(applied) or 'none'}")
 
 
 if __name__ == "__main__":

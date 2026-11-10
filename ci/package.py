@@ -126,6 +126,13 @@ def assemble(base, commit, flavor, channel, suffix):
     shutil.copy2(root / 'LICENSE', stage / 'LICENSE')
     shutil.copy2(launcher, stage / 'RyGTS.exe')
     shutil.copy2(renderer, stage / 'libs/libSceVideoOut.prx')
+    # aminenrr/RyGTS-SPS fork: adcpatch.exe rebuilt from this revision (manifestprep mode).
+    fork_adcpatch = Path('artifacts/adcpatch/adcpatch.exe')
+    if fork_adcpatch.is_file():
+        if fork_adcpatch.read_bytes()[:2] != b'MZ':
+            raise RuntimeError('Expected a Windows PE adcpatch.exe')
+        (stage / 'tools/adcpatch').mkdir(parents=True, exist_ok=True)
+        shutil.copy2(fork_adcpatch, stage / 'tools/adcpatch/adcpatch.exe')
     (stage / 'tools/amd').mkdir(parents=True, exist_ok=True)
     shutil.copy2(root / 'tools/amd/Add-To-AMD-Software.ps1', stage / 'tools/amd/Add-To-AMD-Software.ps1')
     for name_required in ('converter/ryty.exe', 'tools/adcpatch/adcpatch.exe', 'libs/libSceBluetoothHid.prx',
@@ -138,7 +145,8 @@ def assemble(base, commit, flavor, channel, suffix):
         configuration='RelWithDebInfo' if suffix else 'Release', optimized=True,
         pipeline=os.environ.get('CI_PIPELINE_URL'), runtime_base_url=BASE_URL, runtime_base_sha256=BASE_SHA,
         renderer_source=source, launcher_sha256=sha(launcher), renderer_sha256=sha(renderer),
-        rebuilt=['RyGTS.exe', 'libs/libSceVideoOut.prx'],
+        rebuilt=['RyGTS.exe', 'libs/libSceVideoOut.prx'] + (['tools/adcpatch/adcpatch.exe'] if fork_adcpatch.is_file() else []),
+        fork_patches=os.environ.get('RYGT_FORK_PATCHES', ''),
         retained='Other runtime libraries and Windows conversion helpers from pinned October 25 archive')
     if suffix:
         # PDBs are forbidden in the base. Only these explicitly verified same-build
