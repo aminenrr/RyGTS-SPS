@@ -29,6 +29,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # LF checkouts: the renderer patches are applied with git apply.
+          git config --global core.autocrlf input
+          git config --global core.longpaths true
           New-Item -ItemType Directory -Force $env:RYGT_CI_ROOT | Out-Null
           Set-Location $env:RYGT_CI_ROOT
           git init

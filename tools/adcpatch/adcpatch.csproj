@@ -6,6 +6,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="System.IO.Hashing" Version="9.0.0" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\GTToolsSharp\GTToolsSharp\GTToolsSharp.csproj" />
     <None Include="openGrim.ad;grim.ad" CopyToOutputDirectory="PreserveNewest" />
     <ProjectReference Include="..\GTAdhocToolchain\GTAdhocToolchain.Disasm\GTAdhocToolchain.Disasm.csproj" />

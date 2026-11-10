@@ -1,0 +1,554 @@
+diff --git a/src/video_core/cache_storage.cpp b/src/video_core/cache_storage.cpp
+index d3725a45..33c97a38 100644
+--- a/src/video_core/cache_storage.cpp
++++ b/src/video_core/cache_storage.cpp
+@@ -362,6 +362,17 @@ std::vector<std::pair<std::string, std::filesystem::file_time_type>> DataBase::L
+     return blobs;
+ }
+ 
++// FORK-PRECOMPILE: waits (at most a minute) until the writes queued so far are on disk.
++void DataBase::Flush() {
++    if (!opened || archived) {
++        return;
++    }
++    std::packaged_task<void()> marker{[] {}};
++    auto done = marker.get_future();
++    requests.Push(std::move(marker));
++    done.wait_for(std::chrono::minutes{1});
++}
++
+ void DataBase::FinishPreload() {
+     if (archived) {
+         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
+diff --git a/src/video_core/cache_storage.h b/src/video_core/cache_storage.h
+index 8e05b4a6..66a3a63e 100644
+--- a/src/video_core/cache_storage.h
++++ b/src/video_core/cache_storage.h
+@@ -48,6 +48,8 @@ public:
+     [[nodiscard]] bool UsesCompatibleSibling() const { return compatible_sibling; }
+     [[nodiscard]] const std::filesystem::path& StorePath() const { return cache_path; }
+     void FinishPreload();
++    /// FORK-PRECOMPILE: waits until the writes queued so far are done.
++    void Flush();
+ 
+     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
+     bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 8ffbf54b..d4134519 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -35,6 +35,7 @@
+ #include <thread>
+ #include <string>
+ #include <unordered_map>
++#include <unordered_set>
+ #ifdef _WIN32
+ #include <windows.h>
+ #endif
+@@ -339,8 +340,31 @@ static std::filesystem::path g_manifest_dir;
+ static std::filesystem::path g_capture_dir;
+ static bool ManifestRecordOn() {
+     static const bool on = [] {
++        // FORK-PRECOMPILE (aminenrr/RyGTS-SPS): on unless RYGT_MANIFEST_RECORD=0.
+         const char* env = std::getenv("RYGT_MANIFEST_RECORD");
+-        return env && env[0] == '1';
++        return !(env && env[0] == '0');
++    }();
++    return on;
++}
++// FORK-PRECOMPILE: the program folder RyGTS's launcher fills from the player's own game files
++// (<cache>/<serial>-programs/<hash>.bin: code start through the OrbShdr footer), a fallback
++// code source for pre-translation when the local capture lacks a record's code.
++static std::filesystem::path g_programs_dir;
++// FORK-PRECOMPILE: pre-translation runs on the PERF-038 reader thread, before the stored
++// pipelines are read, while the game waits on the splash screen (PERF-102).
++static std::atomic<bool> g_pretranslate_inline{false};
++static std::atomic<bool> g_pretranslate_on_splash{false};
++static bool ManifestPipelinesOn() {
++    static const bool on = [] {
++        const char* env = std::getenv("RYGT_MANIFEST_PIPELINES");
++        return !(env && env[0] == '0');
++    }();
++    return on;
++}
++static bool PretranslateOnSplashWanted() {
++    static const bool on = [] {
++        const char* env = std::getenv("RYGT_PRETRANSLATE_ON_SPLASH");
++        return !(env && env[0] == '0');
+     }();
+     return on;
+ }
+@@ -530,6 +554,262 @@ static bool ReadManifestRecord(const std::filesystem::path& file, ManifestRecord
+     return at == in.size();
+ }
+ 
++// FORK-PRECOMPILE: a record's code from the launcher's program folder when the capture has none.
++// The renderer hashes the code from its start for bininfo.length bytes (code_words); the program
++// file starts at the same first word and runs past it to the footer, so its first code_words
++// words are the code when their XXH3 is the record's. The match is kept in the capture.
++static std::vector<u32> ReadProgramCode(u64 hash, u64 code_xxh, u32 code_words) {
++    if (g_programs_dir.empty() || code_words == 0) {
++        return {};
++    }
++    std::vector<u8> bytes;
++    if (std::FILE* f = std::fopen((g_programs_dir / fmt::format("{:016x}.bin", hash)).string().c_str(),
++                                  "rb")) {
++        std::fseek(f, 0, SEEK_END);
++        const long size = std::ftell(f);
++        std::fseek(f, 0, SEEK_SET);
++        if (size >= long(code_words) * 4) {
++            bytes.resize(size_t(code_words) * 4);
++            if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
++        }
++        std::fclose(f);
++    }
++    if (bytes.empty() || XXH3_64bits(bytes.data(), bytes.size()) != code_xxh) {
++        return {};
++    }
++    std::vector<u32> words(code_words);
++    std::memcpy(words.data(), bytes.data(), bytes.size());
++    WriteWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", hash, code_xxh), words);
++    return words;
++}
++
++// FORK-PRECOMPILE: pipeline records. A graphics pipeline whose every stage was translated this
++// session is kept as <manifest>/pipelines/<pipeline hash>.pip: its key and vertex inputs (pipeline
++// state, no code) and, per stage, the program hash and the SPIR-V hash of its translation (the
++// record names). A store's permutation indices are its own, so after pre-translation the stages
++// are found again by program and SPIR-V hash and the key is stored with the new indices; the
++// PERF-038 precompile then builds it with the stored pipelines.
++static constexpr char PipelineRecordMagic[8] = {'R', 'Y', 'G', 'T', 'P', 'I', 'P', '1'};
++
++static u32 PipelineRecordLayout() {
++    static const u32 layout = [] {
++        Serialization::Archive ar;
++        GraphicsPipelineKey key{};
++        GraphicsPipeline::SerializationSupport sdata{};
++        key.Serialize(ar);
++        sdata.Serialize(ar);
++        return u32(ar.SizeBytes());
++    }();
++    return layout;
++}
++
++static void RecordManifestPipeline(
++    const GraphicsPipelineKey& key, u64 pipeline_hash,
++    const std::array<const Shader::Info*, MaxShaderStages>& infos,
++    const tsl::robin_map<size_t, std::unique_ptr<Program>>& programs,
++    const GraphicsPipeline::SerializationSupport& sdata) {
++    if (!ManifestRecordOn() || !ManifestPipelinesOn() || g_manifest_dir.empty()) {
++        return;
++    }
++    static std::mutex seen_mutex;
++    static std::unordered_set<u64> seen;
++    {
++        std::scoped_lock lk{seen_mutex};
++        if (!seen.insert(pipeline_hash).second) {
++            return;
++        }
++    }
++    struct StageRef {
++        u32 stage;
++        u64 pgm;
++        u64 spv;
++    };
++    std::vector<StageRef> stages;
++    for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
++        const u64 perm_hash = key.stage_hashes[stage];
++        if (perm_hash == 0) {
++            continue;
++        }
++        const Shader::Info* info = infos[stage];
++        if (!info) {
++            return;
++        }
++        const u64 pgm = info->pgm_hash;
++        const auto it = programs.find(pgm);
++        if (it == programs.end() || !it->second) {
++            return;
++        }
++        const auto& modules = it->second->modules;
++        u64 spv = 0;
++        for (size_t i = 0; i < modules.size(); ++i) {
++            if (HashCombine(pgm, u64{i}) == perm_hash) {
++                spv = modules[i].spv_hash;
++                break;
++            }
++        }
++        if (spv == 0) {
++            return; // a stage loaded from the store (or not translated by this session)
++        }
++        stages.push_back({stage, pgm, spv});
++    }
++    if (stages.empty()) {
++        return;
++    }
++    const auto file = g_manifest_dir / "pipelines" / fmt::format("{:016x}.pip", pipeline_hash);
++    std::error_code ec;
++    if (std::filesystem::exists(file, ec)) {
++        return;
++    }
++    Serialization::Archive ar;
++    key.Serialize(ar);
++    sdata.Serialize(ar);
++    std::vector<u8> blob = ar.TakeOff();
++    std::vector<u8> out(PipelineRecordMagic, PipelineRecordMagic + sizeof(PipelineRecordMagic));
++    PutPod(out, PipelineRecordLayout());
++    PutPod(out, u32(stages.size()));
++    for (const auto& ref : stages) {
++        PutPod(out, ref.stage);
++        PutPod(out, ref.pgm);
++        PutPod(out, ref.spv);
++    }
++    PutPod(out, u32(blob.size()));
++    out.insert(out.end(), blob.begin(), blob.end());
++    std::filesystem::create_directories(file.parent_path(), ec);
++    auto temporary = file;
++    temporary += fmt::format(".{}", std::hash<std::thread::id>{}(std::this_thread::get_id()));
++    if (std::FILE* f = std::fopen(temporary.string().c_str(), "wb")) {
++        const bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
++        std::fclose(f);
++        if (ok) std::filesystem::rename(temporary, file, ec);
++        if (!ok || ec) std::filesystem::remove(temporary, ec);
++    }
++}
++
++// FORK-PRECOMPILE: the stored permutation index of a program's translation with this SPIR-V hash
++// (programs the store had before pre-translation), or ~0u.
++static u32 FindStoredPermutation(u64 pgm, u64 spv_xxh,
++                                 std::unordered_map<u64, std::vector<u64>>& stored_hashes) {
++    auto [it, added] = stored_hashes.try_emplace(pgm);
++    if (added) {
++        auto& store = Storage::DataBase::Instance();
++        u32 gap = 0;
++        for (u32 i = 0; i < 64 && gap < 8; ++i) {
++            const auto name = fmt::format("{:#018x}_{}", pgm, i);
++            if (!store.Exists(Storage::BlobType::ShaderBinary, name)) {
++                it->second.push_back(0);
++                ++gap;
++                continue;
++            }
++            gap = 0;
++            std::vector<u32> words;
++            store.Load(Storage::BlobType::ShaderBinary, name, words);
++            it->second.push_back(words.empty() ? 0 : XXH3_64bits(words.data(), words.size() * 4));
++        }
++    }
++    for (size_t i = 0; i < it->second.size(); ++i) {
++        if (it->second[i] == spv_xxh) {
++            return u32(i);
++        }
++    }
++    return ~0u;
++}
++
++// FORK-PRECOMPILE: stores the keys of the pipeline records whose stages are all in the store now
++// (with the store's indices). Returns the number stored; keys the store has are left alone.
++static u32 RestoreManifestPipelines(std::stop_token stop,
++                                    const std::unordered_map<u64, u32>& resolved, u32& unresolved,
++                                    u32& records) {
++    u32 restored = 0;
++    unresolved = 0;
++    records = 0;
++    if (!ManifestPipelinesOn()) {
++        return 0;
++    }
++    auto& store = Storage::DataBase::Instance();
++    std::unordered_map<u64, std::vector<u64>> stored_hashes;
++    std::error_code ec;
++    for (const auto& entry :
++         std::filesystem::directory_iterator(g_manifest_dir / "pipelines", ec)) {
++        if (stop.stop_requested()) break;
++        if (entry.path().extension() != ".pip") continue;
++        ++records;
++        std::vector<u8> in;
++        if (std::FILE* f = std::fopen(entry.path().string().c_str(), "rb")) {
++            std::fseek(f, 0, SEEK_END);
++            const long size = std::ftell(f);
++            std::fseek(f, 0, SEEK_SET);
++            if (size > 0 && size < (1 << 20)) {
++                in.resize(size_t(size));
++                if (std::fread(in.data(), 1, in.size(), f) != in.size()) in.clear();
++            }
++            std::fclose(f);
++        }
++        if (in.size() < sizeof(PipelineRecordMagic) ||
++            std::memcmp(in.data(), PipelineRecordMagic, sizeof(PipelineRecordMagic)) != 0) {
++            ++unresolved;
++            continue;
++        }
++        size_t at = sizeof(PipelineRecordMagic);
++        u32 layout = 0, count = 0, blob_size = 0;
++        if (!GetPod(in, at, layout) || layout != PipelineRecordLayout() || !GetPod(in, at, count) ||
++            count == 0 || count > MaxShaderStages) {
++            ++unresolved;
++            continue;
++        }
++        std::array<u64, MaxShaderStages> new_hashes{};
++        bool ok = true;
++        for (u32 n = 0; n < count && ok; ++n) {
++            u32 stage = 0;
++            u64 pgm = 0, spv = 0;
++            if (!GetPod(in, at, stage) || !GetPod(in, at, pgm) || !GetPod(in, at, spv) ||
++                stage >= MaxShaderStages) {
++                ok = false;
++                break;
++            }
++            u32 perm = ~0u;
++            if (const auto it = resolved.find(HashCombine(pgm, spv)); it != resolved.end()) {
++                perm = it->second;
++            } else {
++                perm = FindStoredPermutation(pgm, spv, stored_hashes);
++            }
++            if (perm == ~0u) {
++                ok = false;
++                break;
++            }
++            new_hashes[stage] = HashCombine(pgm, u64{perm});
++        }
++        if (!ok || !GetPod(in, at, blob_size) || blob_size != layout ||
++            in.size() - at != blob_size) {
++            ++unresolved;
++            continue;
++        }
++        std::vector<u8> blob(in.begin() + at, in.end());
++        Serialization::Archive ar{std::move(blob)};
++        GraphicsPipelineKey key{};
++        GraphicsPipeline::SerializationSupport sdata{};
++        key.Deserialize(ar);
++        sdata.Deserialize(ar);
++        for (u32 stage = 0; stage < MaxShaderStages && ok; ++stage) {
++            // Every stage the key uses must have been listed.
++            if ((key.stage_hashes[stage] != 0) != (new_hashes[stage] != 0)) {
++                ok = false;
++            }
++            key.stage_hashes[stage] = new_hashes[stage];
++        }
++        if (!ok) {
++            ++unresolved;
++            continue;
++        }
++        const u64 hash = std::hash<GraphicsPipelineKey>{}(key);
++        if (store.Exists(Storage::BlobType::PipelineKey, fmt::format("g_{:#018x}", hash))) {
++            continue;
++        }
++        RegisterPipelineData(key, hash, sdata);
++        ++restored;
++    }
++    return restored;
++}
++
+ // Frontend resolution runs under the caller's captured draw state. Workers must
+ // never follow guest descriptor-table pointers after the handoff.
+ struct OwnedTranslation {
+@@ -1531,8 +1811,13 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
+ // guest read replays as recorded. shadGT: an index is taken only where the store has nothing
+ // (UnoccupiedShaderSlot, FIX-271), and programs the store has are never touched.
+ void PipelineCache::PretranslateManifest(std::stop_token stop) {
+-    Common::SetCurrentThreadName("shadGT:Pretranslate");
+-    SleepUnlessStopped(stop, std::chrono::seconds{2});
++    // FORK-PRECOMPILE: on the splash screen (the PERF-038 reader's thread), at once and on the
++    // start-up pipeline workers' share of the cores; in the background as before otherwise.
++    const bool on_splash = g_pretranslate_on_splash.exchange(false);
++    if (!on_splash) {
++        Common::SetCurrentThreadName("shadGT:Pretranslate");
++        SleepUnlessStopped(stop, std::chrono::seconds{2});
++    }
+     if (stop.stop_requested() || !use_stored_shaders || !Storage::DataBase::Instance().IsOpened()) {
+         LOG_WARNING(Render_Vulkan, "PERF-GT7-117: no shader store, nothing pre-translated");
+         return;
+@@ -1551,12 +1836,31 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
+     struct Stored {
+         u32 next_idx = 0;
+         std::vector<Shader::StageSpecialization> specs;
++        std::vector<u32> indices; // FORK-PRECOMPILE: the stored index of each of specs
+     };
+     std::unordered_map<u64, Stored> programs;
++    // FORK-PRECOMPILE: (program, recorded SPIR-V hash) -> stored index, for the pipeline records.
++    std::unordered_map<u64, u32> resolved;
++    std::atomic<u32> from_programs{0};
++    if (on_splash) {
++        g_precompile_total = files.size(); // PERF-098 progress
++        g_precompile_done = 0;
++        LOG_WARNING(Render_Vulkan,
++                    "FORK-PRECOMPILE: pre-translating {} manifest records on the splash screen",
++                    files.size());
++    }
+     const auto work = [&] {
+-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
++        Common::SetCurrentThreadPriority(on_splash ? Common::ThreadPriority::Normal
++                                                   : Common::ThreadPriority::Low);
+         Shader::Pools pools;
+         for (size_t i = next++; i < files.size() && !stop.stop_requested(); i = next++) {
++            if (on_splash) {
++                const u64 done = ++g_precompile_done;
++                if (done % 1000 == 0) {
++                    LOG_WARNING(Render_Vulkan, "FORK-PRECOMPILE: pre-translation {} of {}", done,
++                                files.size());
++                }
++            }
+             ManifestRecord r;
+             if (!ReadManifestRecord(files[i], r) || !ManifestRecordUsable(r)) {
+                 ++failed;
+@@ -1575,11 +1879,16 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
+                     continue;
+                 }
+             }
+-            const auto code =
++            auto code =
+                 ReadWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh));
+             if (code.size() != r.code_words) {
+-                ++no_code;
+-                continue;
++                // FORK-PRECOMPILE: the program the launcher copied from the player's game files.
++                code = ReadProgramCode(r.hash, r.code_xxh, r.code_words);
++                if (code.size() != r.code_words) {
++                    ++no_code;
++                    continue;
++                }
++                ++from_programs;
+             }
+             const auto user_data = r.user_data;
+             std::unique_ptr<Shader::Info> info;
+@@ -1606,7 +1915,12 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
+                 ++in_use; // the game took the program up meanwhile: left alone from here
+                 continue;
+             }
+-            if (std::ranges::find(program.specs, *spec) != program.specs.end()) {
++            if (const auto same = std::ranges::find(program.specs, *spec);
++                same != program.specs.end()) {
++                const auto at = size_t(same - program.specs.begin());
++                if (at < program.indices.size()) {
++                    resolved.emplace(HashCombine(r.hash, r.spv_xxh), program.indices[at]);
++                }
+                 ++duplicate;
+                 continue;
+             }
+@@ -1631,10 +1945,15 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
+                                HashCombine(r.hash, u64{perm_idx}), perm_idx);
+             RegisterShaderBinary(std::move(spv), r.hash, perm_idx);
+             program.specs.push_back(std::move(*spec));
++            program.indices.push_back(u32(perm_idx));
++            resolved[HashCombine(r.hash, r.spv_xxh)] = u32(perm_idx);
+             ++stored;
+         }
+     };
+-    const u32 count = std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
++    const u32 count =
++        on_splash ? std::max(1u, CompilerWorkerBudget::StartupPipelineWorkers(
++                                     std::thread::hardware_concurrency()))
++                  : std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
+     std::vector<std::thread> threads;
+     for (u32 t = 0; t < count; ++t) {
+         threads.emplace_back([&work] {
+@@ -1657,6 +1976,18 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
+                 count, stored.load(), already.load(), duplicate.load(), unreplayed.load(),
+                 no_code.load(), failed.load(), in_use.load());
++    // FORK-PRECOMPILE: the recorded pipelines, with this store's indices, for PERF-038 to build.
++    u32 unresolved = 0, pipeline_records = 0;
++    const u32 restored =
++        stop.stop_requested() ? 0 : RestoreManifestPipelines(stop, resolved, unresolved, pipeline_records);
++    // The store writes are queued: on disk before the stored pipelines are read.
++    Storage::DataBase::Instance().Flush();
++    LOG_WARNING(Render_Vulkan,
++                "FORK-PRECOMPILE: {} translations stored ({} with code from the game files' "
++                "programs), {} of {} pipeline records stored as pipeline keys ({} not "
++                "resolvable){}",
++                stored.load(), from_programs.load(), restored, pipeline_records, unresolved,
++                on_splash ? "; building the stored pipelines on the splash screen next" : "");
+ }
+ 
+ // PERF-GT7-108: builds one recipe's shader objects and writes them to the SO-009 cache file the
+@@ -2178,6 +2509,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
+         const auto gpu = fmt::format("{:04x}-{:04x}", instance.GetVendorID(), instance.GetDeviceID());
+         g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial) / gpu;
+         g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
++        g_programs_dir = cache_dir / fmt::format("{}-programs", serial); // FORK-PRECOMPILE
+         const char* verify = std::getenv("RYGT_MANIFEST_VERIFY");
+         if (verify && verify[0] == '1') {
+             try {
+@@ -2189,8 +2521,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
+                 LOG_WARNING(Render_Vulkan, "PERF-GT7-111: verification unavailable: {}", e.what());
+             }
+         }
++        // FORK-PRECOMPILE: on unless RYGT_MANIFEST_PRETRANSLATE=0.
+         const char* pretranslate = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
+-        pretranslate_wanted = pretranslate && pretranslate[0] == '1';
++        pretranslate_wanted = !(pretranslate && pretranslate[0] == '0');
+     }
+     // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
+     // a program's stored translations are read when a draw first uses it, and new translations
+@@ -2220,7 +2553,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
+             Storage::DataBase::Instance().Open();
+             use_stored_shaders = Storage::DataBase::Instance().IsOpened();
+             if (use_stored_shaders) LoadElseScopeFixed();
+-            if (pretranslate_wanted && use_stored_shaders) { // PERF-GT7-117
++            // FORK-PRECOMPILE: on the splash screen with the PERF-038 precompile (started there).
++            bool pretranslate_thread_wanted = pretranslate_wanted && use_stored_shaders;
++            const auto start_pretranslate_thread = [&] {
++            if (pretranslate_thread_wanted) { // PERF-GT7-117
+                 try {
+                     pretranslate_thread = std::jthread([this](std::stop_token stop) {
+                         try { PretranslateManifest(stop); }
+@@ -2230,6 +2566,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
+                     LOG_WARNING(Render_Vulkan, "PERF-GT7-117: pre-translation unavailable: {}", e.what());
+                 }
+             }
++            };
+             const char* readers = std::getenv("RYGT_STORE_READERS");
+             if (use_stored_shaders && !(readers && readers[0] == '0')) {
+                 try { store_readers = std::make_unique<StoreReaders>(8, *this); }
+@@ -2275,10 +2612,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
+ #ifndef NDEBUG
+                     prewarm_stats.since = std::chrono::steady_clock::now();
+ #endif
++                    if (pretranslate_thread_wanted && PretranslateOnSplashWanted()) {
++                        g_pretranslate_inline = true; // FORK-PRECOMPILE: PrewarmRead runs it
++                        pretranslate_thread_wanted = false;
++                    }
+                     prewarm_reader =
+                         std::jthread{[this](std::stop_token stop) { PrewarmRead(stop); }};
+                 }
+             }
++            start_pretranslate_thread();
+         }
+     }
+     if (CompileMode() == 1 && AsyncPipelines()) {
+@@ -4505,6 +4847,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
+                 // Stored again, so the next session builds it among the first.
+                 if (!S().key_uses_legacy) {
+                     RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
++                    RecordManifestPipeline(S().graphics_key, pipeline_hash, S().infos,
++                                           program_cache, sdata); // FORK-PRECOMPILE
+                 }
+                 retention_now = std::chrono::steady_clock::now();
+                 pipeline_last_use[it->second.get()] = retention_now;
+@@ -4697,6 +5041,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
+ 
+         if (!S().key_uses_legacy) { // D10: old translations are not in this store
+             RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
++            RecordManifestPipeline(S().graphics_key, pipeline_hash, S().infos, program_cache,
++                                   sdata); // FORK-PRECOMPILE
+         } else {
+ #ifndef NDEBUG
+             ++legacy_stats.pipelines;
+@@ -5496,6 +5842,18 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
+     }
+ #endif
+     auto& store = Storage::DataBase::Instance();
++    // FORK-PRECOMPILE: the manifest's translations first (and the recorded pipelines' keys), so
++    // the pipelines below find every stage stored.
++    if (g_pretranslate_inline.exchange(false)) {
++        g_pretranslate_on_splash = true;
++        try {
++            PretranslateManifest(stop);
++        } catch (const std::exception& e) {
++            LOG_WARNING(Render_Vulkan, "FORK-PRECOMPILE: pre-translation stopped: {}", e.what());
++        }
++        g_pretranslate_on_splash = false;
++        if (stop.stop_requested()) return;
++    }
+     RebuildFromPrograms(); // PB-1
+     // The profile file is written only when missing (by the removed precompile), so it can be
+     // older than most entries: GT Sport's is from October 6, the store's entries from October 6

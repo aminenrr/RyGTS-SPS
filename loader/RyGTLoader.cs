@@ -3041,6 +3041,13 @@ namespace RyGT
                 if (!PrepareShaders(baseDir, updateDir))
                     Log("Note: the shaders could not be prepared; they will compile while you play.");
             }
+            // FORK-PRECOMPILE: the programs the precompile manifest lists, from this game's files.
+            if (ManifestProgramsWanted())
+            {
+                SetStatus("Preparing shader programs from your game files...");
+                try { PrepareManifestPrograms(baseDir, updateDir); }
+                catch (Exception e) { Log("Shader programs: " + e.Message); }
+            }
 
             GameBuildIntegrity.Record(Exe);
             Log("Recorded GTSport.exe SHA-256: " + GameBuildIntegrity.Hash(Exe));
@@ -3177,6 +3184,59 @@ namespace RyGT
                 if (process.ExitCode != 0) return false;
                 try { File.WriteAllText(ShaderPackStamp, ToolHash(ShaderPack)); } catch { }
                 return true;
+            }
+        }
+
+        // FORK-PRECOMPILE (aminenrr/RyGTS-SPS): the renderer records each shader translation as a
+        // manifest record (inputs and hashes, no code) in shaders\CUSA03220.manifest, and on a start
+        // with an empty shader store translates them on the splash screen and builds the recorded
+        // pipelines. adcpatch manifestprep copies each record's program out of this PC's game files
+        // into shaders\CUSA03220.capture when it is not there (a fresh install with a shipped list
+        // in tools\adcpatch\manifest, or a capture folder that was removed).
+        // RYGT_MANIFEST_PREP=0 skips it.
+        string ShippedManifest { get { return Path.Combine(root, "tools", "adcpatch", "manifest"); } }
+
+        bool ManifestProgramsWanted()
+        {
+            if (Environment.GetEnvironmentVariable("RYGT_MANIFEST_PREP") == "0") return false;
+            if (!File.Exists(Path.Combine(root, "tools", "adcpatch", "adcpatch.exe"))) return false;
+            return Directory.Exists(Path.Combine(ShaderFolder, "CUSA03220.manifest")) || Directory.Exists(ShippedManifest);
+        }
+
+        bool PrepareManifestPrograms(string baseDir, string updateDir)
+        {
+            string tool = Path.Combine(root, "tools", "adcpatch", "adcpatch.exe");
+            string cache = ShaderFolder;
+            Directory.CreateDirectory(cache);
+            Func<string, string> arg = d => "\"" + (d ?? "").TrimEnd('\\') + "\"";
+            string arguments = "manifestprep " + arg(baseDir) + " " + arg(updateDir) + " " + arg(cache);
+            if (Directory.Exists(ShippedManifest)) arguments += " " + arg(ShippedManifest);
+            Log("> adcpatch.exe " + arguments);
+            var info = new ProcessStartInfo(tool, arguments)
+            {
+                WorkingDirectory = Path.GetDirectoryName(tool), UseShellExecute = false, CreateNoWindow = true,
+                RedirectStandardOutput = true, RedirectStandardError = true
+            };
+            var lines = new List<string>();
+            using (var process = new Process { StartInfo = info })
+            {
+                DataReceivedEventHandler collect = delegate (object sender, DataReceivedEventArgs e)
+                {
+                    if (e.Data == null) return;
+                    lock (lines) lines.Add(e.Data);
+                    if (e.Data.Contains("shader programs")) Log(e.Data);
+                };
+                process.OutputDataReceived += collect;
+                process.ErrorDataReceived += collect;
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                process.WaitForExit();
+                lock (lines)
+                {
+                    try { File.WriteAllLines(Path.Combine(Path.GetDirectoryName(tool), "manifestprep.log"), lines); } catch { }
+                }
+                return process.ExitCode == 0;
             }
         }
 
@@ -3518,6 +3578,14 @@ namespace RyGT
                         SetStatus("Preparing shaders from your game files (a few minutes, once)...");
                         try { PrepareShaders(gameDir, updateDir); }
                         catch (Exception e) { Log("Shaders: " + e.Message); }
+                    }
+                    // FORK-PRECOMPILE: programs of manifest records new since the last start (quick
+                    // when there are none; indexing the game files the first time takes minutes).
+                    if (ManifestProgramsWanted() && Directory.Exists(gameDir))
+                    {
+                        SetStatus("Preparing shader programs from your game files...");
+                        try { PrepareManifestPrograms(gameDir, updateDir); }
+                        catch (Exception e) { Log("Shader programs: " + e.Message); }
                     }
                     verified = true;
                 }

@@ -380,6 +380,153 @@ if (mode == "shaderprep")
     return 0;
 }
 
+if (mode == "manifestprep")
+{
+    // manifestprep <game> <update or ""> <shaders dir> [<shipped list dir>...]: FORK-PRECOMPILE
+    // (aminenrr/RyGTS-SPS). Reads the renderer's precompile manifest records (*.rec: inputs and
+    // hashes, no code) from <shaders dir>\CUSA03220.manifest and any shipped list folders, and for
+    // each record whose program code is not in <shaders dir>\CUSA03220.capture yet, copies it out
+    // of the player's own game files as {hash:x16}-{XXH3_64(code):x16}.code (the renderer's
+    // capture name; it pre-translates those on the splash screen). The program is found by the
+    // OrbShdr footer hash; an index of the footers in the game files (built once, the slow part)
+    // is kept in <shaders dir>\CUSA03220-shader-index.tsv.
+    string game = args[1], update = args[2], cache = args[3];
+    const string serial = "CUSA03220";
+    var listDirs = new List<string> { Path.Combine(cache, serial + ".manifest") };
+    listDirs.AddRange(args.Skip(4));
+    string capture = Path.Combine(cache, serial + ".capture");
+    string failedList = Path.Combine(cache, serial + "-manifestprep-failed.txt");
+    var failedBefore = File.Exists(failedList)
+        ? File.ReadAllLines(failedList).Select(l => l.Trim()).Where(l => l.Length != 0).ToHashSet()
+        : new HashSet<string>();
+    var needed = new Dictionary<(ulong hash, ulong xxh), uint>();
+    int records = 0;
+    foreach (var dir in listDirs.Where(Directory.Exists))
+    {
+        foreach (var file in Directory.EnumerateFiles(dir, "*.rec", SearchOption.AllDirectories))
+        {
+            // RYGTMAN1, u32 version, u32 hw stage, u32 sw stage, u64 hash, u64 code XXH3, u32 code words
+            var head = new byte[40];
+            try
+            {
+                using var f = File.OpenRead(file);
+                if (f.Read(head, 0, head.Length) != head.Length) continue;
+            }
+            catch (IOException) { continue; }
+            if (!head.AsSpan(0, 8).SequenceEqual("RYGTMAN1"u8)) continue;
+            records++;
+            ulong hash = BitConverter.ToUInt64(head, 20), xxh = BitConverter.ToUInt64(head, 28);
+            uint words = BitConverter.ToUInt32(head, 36);
+            if (words == 0 || words > (1u << 20)) continue;
+            if (failedBefore.Contains($"{hash:x16}-{xxh:x16}")) continue;
+            if (File.Exists(Path.Combine(capture, $"{hash:x16}-{xxh:x16}.code"))) continue;
+            needed.TryAdd((hash, xxh), words);
+        }
+    }
+    if (needed.Count == 0)
+    {
+        Console.WriteLine($"0 of 0 shader programs copied from the game files ({records} manifest records, all prepared)");
+        return 0;
+    }
+    var volumes = new List<string>();
+    if (!string.IsNullOrEmpty(update)) volumes.Add(Path.Combine(update, "gt.idx"));
+    volumes.Add(Path.Combine(game, "gt.idx"));
+    var gameDirs = new[] { update, game }.Where(d => !string.IsNullOrEmpty(d) && Directory.Exists(d)).ToList();
+    string indexFile = Path.Combine(cache, serial + "-shader-index.tsv");
+    var index = new Dictionary<ulong, (string path, long footer)>();
+    if (File.Exists(indexFile))
+    {
+        foreach (var line in File.ReadLines(indexFile))
+        {
+            var f = line.Split('\t');
+            if (f.Length == 3 && ulong.TryParse(f[0], System.Globalization.NumberStyles.HexNumber, null, out var h) &&
+                long.TryParse(f[2], out var footer))
+                index.TryAdd(h, (f[1], footer));
+        }
+    }
+    else
+    {
+        Console.WriteLine("Indexing the shader programs in the game files (once, a few minutes)...");
+        // Files on disk first (the executable and its modules), then every volume file.
+        foreach (var dir in gameDirs)
+        {
+            var disk = new List<string>();
+            if (File.Exists(Path.Combine(dir, "eboot.bin"))) disk.Add(Path.Combine(dir, "eboot.bin"));
+            string modules = Path.Combine(dir, "sce_module");
+            if (Directory.Exists(modules)) disk.AddRange(Directory.GetFiles(modules, "*.prx"));
+            foreach (var file in disk)
+            {
+                string name = "disk:" + Path.GetRelativePath(dir, file).Replace('\\', '/');
+                foreach (var (h, footer, _) in GameShaders.Find(File.ReadAllBytes(file)))
+                    index.TryAdd(h, (name, footer));
+            }
+        }
+        int scanned = 0;
+        string scanTemp = Path.Combine(Path.GetTempPath(), "rygt-manifestprep-scan-" + Environment.ProcessId);
+        try
+        {
+            GameShaders.ForEachFile(volumes, scanTemp, (path, data) =>
+            {
+                foreach (var (h, footer, _) in GameShaders.Find(data))
+                    index.TryAdd(h, (path, footer));
+                if (++scanned % 2000 == 0) Console.WriteLine($"{scanned} game files indexed, {index.Count} shader programs");
+            });
+        }
+        finally { try { Directory.Delete(scanTemp, true); } catch { } }
+        var tmp = indexFile + ".tmp";
+        File.WriteAllLines(tmp, index.Select(kv => $"{kv.Key:x16}\t{kv.Value.path}\t{kv.Value.footer}"));
+        File.Move(tmp, indexFile, true);
+        Console.WriteLine($"{index.Count} shader programs indexed in {scanned} game files");
+    }
+    Directory.CreateDirectory(capture);
+    int copied = 0, notFound = 0, mismatch = 0;
+    var failedNow = new List<string>();
+    string work = Path.Combine(Path.GetTempPath(), "rygt-manifestprep-" + Environment.ProcessId);
+    try
+    {
+        var located = needed.Where(n => index.ContainsKey(n.Key.hash)).ToList();
+        foreach (var n in needed.Where(n => !index.ContainsKey(n.Key.hash)))
+        {
+            notFound++;
+            failedNow.Add($"{n.Key.hash:x16}-{n.Key.xxh:x16}");
+        }
+        var volumePaths = located.Select(n => index[n.Key.hash].path).Where(p => !p.StartsWith("disk:")).Distinct().ToList();
+        var extracted = volumePaths.Count == 0 ? new HashSet<string>() : GameFiles.Extract(volumes, volumePaths, work);
+        foreach (var group in located.GroupBy(n => index[n.Key.hash].path))
+        {
+            string file = null;
+            if (group.Key.StartsWith("disk:"))
+                file = gameDirs.Select(d => Path.Combine(d, group.Key.Substring(5).Replace('/', Path.DirectorySeparatorChar))).FirstOrDefault(File.Exists);
+            else
+                file = Path.Combine(work, group.Key.ToUpperInvariant().Replace('/', Path.DirectorySeparatorChar));
+            byte[] data = file != null && File.Exists(file) ? File.ReadAllBytes(file) : null;
+            foreach (var n in group)
+            {
+                long footer = index[n.Key.hash].footer;
+                int start = data == null || footer + 32 > data.Length ? -1 : GameShaders.CodeStart(data, footer);
+                long length = (long)n.Value * 4;
+                if (start < 0 || start + length > data.Length ||
+                    System.IO.Hashing.XxHash3.HashToUInt64(data.AsSpan(start, (int)length)) != n.Key.xxh)
+                {
+                    mismatch++;
+                    failedNow.Add($"{n.Key.hash:x16}-{n.Key.xxh:x16}");
+                    continue;
+                }
+                string target = Path.Combine(capture, $"{n.Key.hash:x16}-{n.Key.xxh:x16}.code");
+                string temp = target + ".tmp";
+                File.WriteAllBytes(temp, data.AsSpan(start, (int)length).ToArray());
+                File.Move(temp, target, true);
+                copied++;
+            }
+        }
+    }
+    finally { try { Directory.Delete(work, true); } catch { } }
+    if (failedNow.Count != 0) File.AppendAllLines(failedList, failedNow);
+    Console.WriteLine($"{copied} of {needed.Count} shader programs copied from the game files ({records} manifest records; " +
+                      $"{notFound} not in the game files, {mismatch} different from the recorded code)");
+    return 0;
+}
+
 if (mode == "extract")
 {
     // extract <game folder> <update folder or ""> <out dir> <path>...: research helper.
